@@ -50,7 +50,152 @@ class GymPlatformApiTest(unittest.TestCase):
         progress = self.client.post(f"/api/progress/{member_id}", json={"weight_kg": 72})
         self.assertEqual(progress.status_code, 201)
 
+    def test_multi_branch_signup_and_branch_selection(self):
+        signup = self.client.post(
+            "/api/auth/signup",
+            json={
+                "gym_name": "North Star Fitness",
+                "owner_name": "Nisha Rao",
+                "phone": "+91 90000 00001",
+                "password": "owner-pass-123",
+                "branches": ["Indiranagar", "Koramangala"],
+            },
+        )
+        self.assertEqual(signup.status_code, 201)
+        payload = signup.json()
+        self.assertTrue(payload["gym"]["multi_branch_enabled"])
+        self.assertEqual(len(payload["user"]["branches"]), 2)
+        headers = {"Authorization": f"Bearer {payload['token']}"}
+        second_branch = payload["user"]["branches"][1]
+        selected = self.client.post("/api/auth/select-branch", headers=headers, json={"branch_id": second_branch["id"]})
+        self.assertEqual(selected.status_code, 200)
+        summary = self.client.get("/api/dashboard/summary", headers=headers)
+        self.assertEqual(summary.status_code, 200)
+        self.assertEqual(summary.json()["branch"]["id"], second_branch["id"])
+
+    def test_owner_can_provision_staff_and_staff_cannot_manage_access(self):
+        signup = self.client.post(
+            "/api/auth/signup",
+            json={
+                "gym_name": "Daily Strength",
+                "owner_name": "Owner Account",
+                "phone": "+91 90000 00002",
+                "password": "owner-pass-123",
+                "branches": ["Main Floor"],
+            },
+        ).json()
+        owner_headers = {"Authorization": f"Bearer {signup['token']}"}
+        branch_id = signup["user"]["branches"][0]["id"]
+        created = self.client.post(
+            "/api/access/users",
+            headers=owner_headers,
+            json={
+                "name": "Reception Desk",
+                "phone": "+91 90000 00003",
+                "role": "staff",
+                "branch_ids": [branch_id],
+                "temporary_password": "staff-pass-123",
+            },
+        )
+        self.assertEqual(created.status_code, 201)
+        self.assertTrue(created.json()["must_change_password"])
+        login = self.client.post(
+            "/api/auth/login",
+            json={
+                "workspace_slug": signup["gym"]["workspace_slug"],
+                "phone": "+91 90000 00003",
+                "password": "staff-pass-123",
+            },
+        )
+        self.assertEqual(login.status_code, 200)
+        staff_headers = {"Authorization": f"Bearer {login.json()['token']}"}
+        self.assertEqual(self.client.get("/api/dashboard/summary", headers=staff_headers).status_code, 200)
+        self.assertEqual(self.client.get("/api/access/users", headers=staff_headers).status_code, 403)
+        self.assertEqual(self.client.get("/api/integrations/whatsapp", headers=staff_headers).status_code, 403)
+        changed = self.client.post(
+            "/api/auth/change-password",
+            headers=staff_headers,
+            json={"current_password": "staff-pass-123", "new_password": "staff-pass-456"},
+        )
+        self.assertEqual(changed.status_code, 200)
+        me = self.client.get("/api/auth/me", headers=staff_headers)
+        self.assertFalse(me.json()["user"]["must_change_password"])
+        self.assertEqual(self.client.post("/api/auth/logout", headers=staff_headers).status_code, 200)
+        self.assertEqual(self.client.get("/api/auth/me", headers=staff_headers).status_code, 401)
+
+    def test_owner_cannot_assign_a_user_to_another_gyms_branch(self):
+        first = self.client.post(
+            "/api/auth/signup",
+            json={
+                "gym_name": "First Gym",
+                "owner_name": "First Owner",
+                "phone": "+91 90000 00004",
+                "password": "owner-pass-123",
+                "branches": ["First Branch"],
+            },
+        ).json()
+        second = self.client.post(
+            "/api/auth/signup",
+            json={
+                "gym_name": "Second Gym",
+                "owner_name": "Second Owner",
+                "phone": "+91 90000 00005",
+                "password": "owner-pass-123",
+                "branches": ["Second Branch"],
+            },
+        ).json()
+        response = self.client.post(
+            "/api/access/users",
+            headers={"Authorization": f"Bearer {first['token']}"},
+            json={
+                "name": "Invalid Assignment",
+                "phone": "+91 90000 00006",
+                "role": "trainer",
+                "branch_ids": [second["user"]["branches"][0]["id"]],
+                "temporary_password": "trainer-pass-123",
+            },
+        )
+        self.assertEqual(response.status_code, 422)
+
+    def test_each_gym_has_an_isolated_owner_managed_whatsapp_connection(self):
+        first = self.client.post(
+            "/api/auth/signup",
+            json={
+                "gym_name": "WhatsApp First Gym",
+                "owner_name": "First Owner",
+                "phone": "+91 90000 00007",
+                "password": "owner-pass-123",
+                "branches": ["Main Branch"],
+            },
+        ).json()
+        second = self.client.post(
+            "/api/auth/signup",
+            json={
+                "gym_name": "WhatsApp Second Gym",
+                "owner_name": "Second Owner",
+                "phone": "+91 90000 00008",
+                "password": "owner-pass-123",
+                "branches": ["Main Branch"],
+            },
+        ).json()
+        first_headers = {"Authorization": f"Bearer {first['token']}"}
+        second_headers = {"Authorization": f"Bearer {second['token']}"}
+        configured = self.client.put(
+            "/api/integrations/whatsapp",
+            headers=first_headers,
+            json={
+                "business_account_id": "waba-1001",
+                "phone_number_id": "phone-1001",
+                "display_phone_number": "+91 90000 10001",
+                "renewal_template_name": "membership_renewal_reminder",
+            },
+        )
+        self.assertEqual(configured.status_code, 200)
+        self.assertEqual(configured.json()["status"], "pending-verification")
+        self.assertNotIn("access_token", configured.json())
+        self.assertEqual(self.client.get("/api/integrations/whatsapp", headers=first_headers).json()["phone_number_id"], "phone-1001")
+        self.assertEqual(self.client.get("/api/integrations/whatsapp", headers=second_headers).json()["status"], "not-configured")
+
 
 if __name__ == "__main__":
     unittest.main()
-
