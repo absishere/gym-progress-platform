@@ -22,14 +22,14 @@ try:
     from .database import Base, engine, get_db
     from .models import (
         Branch, Gym, LoginFailure, Member, Plan, Progress, Reminder, SessionToken,
-        TrainerMemberAssignment, User, UserBranchAccess, WhatsAppConnection,
+        PlatformAdmin, PlatformSession, TrainerMemberAssignment, User, UserBranchAccess, WhatsAppConnection,
     )
     from .secrets_store import decrypt_secret, encrypt_secret
 except ImportError:
     from database import Base, engine, get_db
     from models import (
         Branch, Gym, LoginFailure, Member, Plan, Progress, Reminder, SessionToken,
-        TrainerMemberAssignment, User, UserBranchAccess, WhatsAppConnection,
+        PlatformAdmin, PlatformSession, TrainerMemberAssignment, User, UserBranchAccess, WhatsAppConnection,
     )
     from secrets_store import decrypt_secret, encrypt_secret
 
@@ -38,6 +38,7 @@ APP_ENV = os.getenv("GYM_APP_ENV", "development").lower()
 SESSION_DAYS = int(os.getenv("GYM_SESSION_DAYS", "30"))
 LOGIN_WINDOW_MINUTES = int(os.getenv("GYM_LOGIN_WINDOW_MINUTES", "15"))
 LOGIN_MAX_FAILURES = int(os.getenv("GYM_LOGIN_MAX_FAILURES", "5"))
+PUBLIC_SIGNUP_ENABLED = os.getenv("GYM_PUBLIC_SIGNUP_ENABLED", "false").lower() == "true"
 CORS_ORIGINS = [value.strip().rstrip("/") for value in os.getenv("GYM_CORS_ORIGINS", "").split(",") if value.strip()]
 if APP_ENV != "production":
     CORS_ORIGINS = sorted({*CORS_ORIGINS, "http://localhost:5173", "http://127.0.0.1:5173"})
@@ -54,6 +55,30 @@ class GymSignup(BaseModel):
     phone: str = Field(min_length=8, max_length=20)
     password: str = Field(min_length=8, max_length=128)
     branches: list[str] = Field(min_length=1, max_length=25)
+
+
+class PlatformLoginRequest(BaseModel):
+    phone: str = Field(min_length=8, max_length=20)
+    password: str = Field(min_length=8, max_length=128)
+
+
+class PlatformGymCreate(BaseModel):
+    gym_name: str = Field(min_length=2, max_length=100)
+    owner_name: str = Field(min_length=2, max_length=80)
+    owner_phone: str = Field(min_length=8, max_length=20)
+    temporary_password: str = Field(min_length=8, max_length=128)
+    branches: list[str] = Field(min_length=1, max_length=25)
+    multi_branch_enabled: bool = False
+    account_status: Literal["active", "suspended"] = "active"
+
+
+class PlatformGymUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=2, max_length=100)
+    account_status: Literal["active", "suspended"] | None = None
+    multi_branch_enabled: bool | None = None
+    owner_name: str | None = Field(default=None, min_length=2, max_length=80)
+    owner_phone: str | None = Field(default=None, min_length=8, max_length=20)
+    owner_temporary_password: str | None = Field(default=None, min_length=8, max_length=128)
 
 
 class LoginRequest(BaseModel):
@@ -170,6 +195,13 @@ def create_session(db: Session, user_id: int, branch_id: int) -> str:
     return token
 
 
+def create_platform_session(db: Session, admin_id: int) -> str:
+    token, now = secrets.token_urlsafe(32), utc_now()
+    db.execute(delete(PlatformSession).where(PlatformSession.expires_at <= now))
+    db.add(PlatformSession(token=hash_session_token(token), admin_id=admin_id, created_at=now, expires_at=now + timedelta(days=SESSION_DAYS)))
+    return token
+
+
 def enforce_login_rate_limit(db: Session, slug: str, phone: str) -> None:
     cutoff = utc_now() - timedelta(minutes=LOGIN_WINDOW_MINUTES)
     db.execute(delete(LoginFailure).where(LoginFailure.attempted_at <= cutoff))
@@ -189,7 +221,23 @@ def get_current_session(authorization: Annotated[str | None, Header()] = None) -
         access = db.get(UserBranchAccess, (row.user_id, row.active_branch_id))
         if user is None or not user.is_active or access is None:
             raise HTTPException(status_code=401, detail="Session expired or invalid")
+        gym = db.get(Gym, user.gym_id)
+        if gym is None or gym.account_status != "active":
+            raise HTTPException(status_code=403, detail="Gym access is not active")
         return {"token": row.token, "user_id": user.id, "gym_id": user.gym_id, "role": user.role, "active_branch_id": row.active_branch_id}
+
+
+def get_platform_session(authorization: Annotated[str | None, Header()] = None) -> dict:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Platform authentication required")
+    with get_db() as db:
+        row = db.scalar(select(PlatformSession).where(PlatformSession.token == hash_session_token(authorization.removeprefix("Bearer ").strip())))
+        if row is None or row.expires_at.replace(tzinfo=timezone.utc) <= utc_now():
+            raise HTTPException(status_code=401, detail="Platform session expired or invalid")
+        admin = db.get(PlatformAdmin, row.admin_id)
+        if admin is None or not admin.is_active:
+            raise HTTPException(status_code=401, detail="Platform session expired or invalid")
+        return {"token": row.token, "admin_id": admin.id, "phone": admin.phone, "name": admin.name}
 
 
 def require_roles(*roles: UserRole):
@@ -203,6 +251,13 @@ def require_roles(*roles: UserRole):
 def init_database() -> None:
     if APP_ENV != "production":
         Base.metadata.create_all(engine)
+    phone, password = os.getenv("GYM_PLATFORM_ADMIN_PHONE"), os.getenv("GYM_PLATFORM_ADMIN_PASSWORD")
+    if phone and password:
+        with get_db() as db:
+            normalized = normalize_phone(phone)
+            admin = db.scalar(select(PlatformAdmin).where(PlatformAdmin.phone == normalized))
+            if admin is None:
+                db.add(PlatformAdmin(name=os.getenv("GYM_PLATFORM_ADMIN_NAME", "Forge Admin"), phone=normalized, password_hash=hash_password(password), created_at=utc_now()))
 
 
 @asynccontextmanager
@@ -225,16 +280,22 @@ async def add_security_headers(request, call_next):
 
 @app.post("/api/auth/signup", status_code=201)
 def signup(request: GymSignup) -> dict:
-    names = list(dict.fromkeys(name.strip() for name in request.branches if name.strip()))
+    if not PUBLIC_SIGNUP_ENABLED:
+        raise HTTPException(status_code=403, detail="Public signup is not enabled yet")
+    return create_gym_workspace(request.gym_name, request.owner_name, request.phone, request.password, request.branches, "self_serve")
+
+
+def create_gym_workspace(gym_name: str, owner_name: str, owner_phone: str, password: str, branch_names: list[str], sales_channel: str, account_status: str = "active", multi_branch_enabled: bool | None = None) -> dict:
+    names = list(dict.fromkeys(name.strip() for name in branch_names if name.strip()))
     if not names:
         raise HTTPException(status_code=422, detail="Add at least one branch")
     with get_db() as db:
         now = utc_now()
-        gym = Gym(name=request.gym_name.strip(), workspace_slug=unique_workspace_slug(db, request.gym_name), multi_branch_enabled=len(names) > 1, created_at=now)
+        gym = Gym(name=gym_name.strip(), workspace_slug=unique_workspace_slug(db, gym_name), multi_branch_enabled=len(names) > 1 if multi_branch_enabled is None else multi_branch_enabled, account_status=account_status, sales_channel=sales_channel, created_at=now)
         db.add(gym); db.flush()
         branches = [Branch(gym_id=gym.id, name=name, created_at=now) for name in names]
         db.add_all(branches); db.flush()
-        user = User(gym_id=gym.id, name=request.owner_name.strip(), phone=normalize_phone(request.phone), password_hash=hash_password(request.password), role="gym_owner", created_at=now)
+        user = User(gym_id=gym.id, name=owner_name.strip(), phone=normalize_phone(owner_phone), password_hash=hash_password(password), role="gym_owner", must_change_password=True, created_at=now)
         db.add(user); db.flush()
         db.add_all([UserBranchAccess(user_id=user.id, branch_id=branch.id) for branch in branches])
         db.flush()
@@ -248,6 +309,9 @@ def login(request: LoginRequest) -> dict:
     with get_db() as db:
         enforce_login_rate_limit(db, slug, phone)
         user = db.scalar(select(User).join(Gym).where(Gym.workspace_slug == slug, User.phone == phone))
+        gym = db.scalar(select(Gym).where(Gym.workspace_slug == slug))
+        if gym is not None and gym.account_status != "active":
+            raise HTTPException(status_code=403, detail="Gym access is not active")
         if user is None or not user.is_active or not verify_password(request.password, user.password_hash):
             db.add(LoginFailure(workspace_slug=slug, phone=phone, attempted_at=utc_now())); db.commit()
             raise HTTPException(status_code=401, detail="Invalid workspace, phone number, or password")
@@ -399,8 +463,113 @@ def add_progress(member_id: int, request: ProgressCreate, session: Annotated[dic
 @app.get("/api/dashboard/summary")
 def dashboard_summary(session: Annotated[dict, Depends(require_roles("gym_owner", "staff", "trainer"))]) -> dict:
     members = list_members(session); branch_id = session["active_branch_id"]
-    with get_db() as db: branch = db.get(Branch, branch_id)
-    return {"branch": branch_payload(branch), "members": {"total": len(members), "active": sum(m["days_left"] >= 0 for m in members), "expiring_this_week": sum(0 <= m["days_left"] <= 7 for m in members), "expired": sum(m["days_left"] < 0 for m in members)}}
+    active = sum(m["days_left"] >= 0 for m in members)
+    expiring = [m for m in members if 0 <= m["days_left"] <= 7]
+    expired = sum(m["days_left"] < 0 for m in members)
+    with get_db() as db:
+        branch = db.get(Branch, branch_id)
+        reminder_count = db.scalar(select(func.count()).select_from(Reminder).join(Member).where(Member.branch_id == branch_id, Reminder.sent_at >= utc_now() - timedelta(days=7)))
+        whatsapp = db.get(WhatsAppConnection, session["gym_id"])
+    if expiring:
+        title = f"{len(expiring)} member{'s' if len(expiring) != 1 else ''} need renewal follow-up this week."
+        detail = "WhatsApp is connected, so you can queue reminders now." if whatsapp and whatsapp.status == "connected" else "Connect WhatsApp before sending real reminders from Forge."
+    elif expired:
+        title = f"{expired} expired membership{'s' if expired != 1 else ''} need recovery follow-up."
+        detail = "Start with recently expired members before adding new acquisition work."
+    else:
+        title = "No urgent renewal risk in the next 7 days."
+        detail = "The insight will update as members approach expiry or payment records are added."
+    return {
+        "branch": branch_payload(branch),
+        "members": {"total": len(members), "active": active, "expiring_this_week": len(expiring), "expired": expired},
+        "retention": {"reminders_sent_last_7_days": reminder_count or 0},
+        "revenue": {"monthly": None, "renewal_rate": None, "note": "Revenue and renewal rate need payment records; Forge is not estimating them."},
+        "insight": {"title": title, "detail": detail, "action_enabled": bool(expiring), "expiring_member_ids": [member["id"] for member in expiring]},
+    }
+
+
+@app.post("/api/platform/auth/login")
+def platform_login(request: PlatformLoginRequest) -> dict:
+    with get_db() as db:
+        admin = db.scalar(select(PlatformAdmin).where(PlatformAdmin.phone == normalize_phone(request.phone)))
+        if admin is None or not admin.is_active or not verify_password(request.password, admin.password_hash):
+            raise HTTPException(status_code=401, detail="Invalid platform credentials")
+        return {"token": create_platform_session(db, admin.id), "admin": {"id": admin.id, "name": admin.name, "phone": admin.phone}}
+
+
+@app.get("/api/platform/auth/me")
+def platform_me(session: Annotated[dict, Depends(get_platform_session)]) -> dict:
+    return {"admin": {"id": session["admin_id"], "name": session["name"], "phone": session["phone"]}}
+
+
+@app.post("/api/platform/auth/logout")
+def platform_logout(session: Annotated[dict, Depends(get_platform_session)]) -> dict:
+    with get_db() as db:
+        db.execute(delete(PlatformSession).where(PlatformSession.token == session["token"]))
+    return {"status": "logged-out"}
+
+
+def platform_gym_payload(db: Session, gym: Gym) -> dict:
+    owners = db.scalars(select(User).where(User.gym_id == gym.id, User.role == "gym_owner").order_by(User.id)).all()
+    branches = db.scalars(select(Branch).where(Branch.gym_id == gym.id).order_by(Branch.name)).all()
+    return {
+        "id": gym.id,
+        "name": gym.name,
+        "workspace_slug": gym.workspace_slug,
+        "account_status": gym.account_status,
+        "sales_channel": gym.sales_channel,
+        "multi_branch_enabled": gym.multi_branch_enabled,
+        "branches": [branch_payload(branch) for branch in branches],
+        "owners": [{"id": owner.id, "name": owner.name, "phone": owner.phone, "is_active": owner.is_active} for owner in owners],
+    }
+
+
+@app.get("/api/platform/gyms")
+def platform_list_gyms(_: Annotated[dict, Depends(get_platform_session)]) -> list[dict]:
+    with get_db() as db:
+        return [platform_gym_payload(db, gym) for gym in db.scalars(select(Gym).order_by(Gym.created_at.desc())).all()]
+
+
+@app.post("/api/platform/gyms", status_code=201)
+def platform_create_gym(request: PlatformGymCreate, _: Annotated[dict, Depends(get_platform_session)]) -> dict:
+    payload = create_gym_workspace(request.gym_name, request.owner_name, request.owner_phone, request.temporary_password, request.branches, "direct", request.account_status, request.multi_branch_enabled)
+    with get_db() as db:
+        return platform_gym_payload(db, db.get(Gym, payload["gym"]["id"]))
+
+
+@app.patch("/api/platform/gyms/{gym_id}")
+def platform_update_gym(gym_id: int, request: PlatformGymUpdate, _: Annotated[dict, Depends(get_platform_session)]) -> dict:
+    with get_db() as db:
+        gym = db.get(Gym, gym_id)
+        if gym is None:
+            raise HTTPException(status_code=404, detail="Gym not found")
+        if request.name is not None:
+            gym.name = request.name.strip()
+        if request.account_status is not None:
+            gym.account_status = request.account_status
+        if request.multi_branch_enabled is not None:
+            gym.multi_branch_enabled = request.multi_branch_enabled
+        owner = db.scalar(select(User).where(User.gym_id == gym.id, User.role == "gym_owner").order_by(User.id))
+        if owner is not None:
+            if request.owner_name is not None:
+                owner.name = request.owner_name.strip()
+            if request.owner_phone is not None:
+                owner.phone = normalize_phone(request.owner_phone)
+            if request.owner_temporary_password is not None:
+                owner.password_hash = hash_password(request.owner_temporary_password)
+                owner.must_change_password = True
+        db.flush()
+        return platform_gym_payload(db, gym)
+
+
+@app.delete("/api/platform/gyms/{gym_id}")
+def platform_delete_gym(gym_id: int, _: Annotated[dict, Depends(get_platform_session)]) -> dict:
+    with get_db() as db:
+        gym = db.get(Gym, gym_id)
+        if gym is None:
+            raise HTTPException(status_code=404, detail="Gym not found")
+        db.delete(gym)
+    return {"status": "deleted"}
 
 
 @app.get("/api/access/users")

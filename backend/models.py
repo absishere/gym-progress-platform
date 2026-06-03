@@ -17,7 +17,28 @@ class Gym(Base):
     name: Mapped[str] = mapped_column(String(100))
     workspace_slug: Mapped[str] = mapped_column(String(80), unique=True, index=True)
     multi_branch_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    account_status: Mapped[str] = mapped_column(String(30), default="active")
+    sales_channel: Mapped[str] = mapped_column(String(30), default="direct")
+    access_expires_on: Mapped[Date | None] = mapped_column(Date, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class PlatformAdmin(Base):
+    __tablename__ = "platform_admins"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(80))
+    phone: Mapped[str] = mapped_column(String(20), unique=True, index=True)
+    password_hash: Mapped[str] = mapped_column(String(255))
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class PlatformSession(Base):
+    __tablename__ = "platform_sessions"
+    token: Mapped[str] = mapped_column(String(64), primary_key=True)
+    admin_id: Mapped[int] = mapped_column(ForeignKey("platform_admins.id", ondelete="CASCADE"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
 
 
 class Branch(Base):

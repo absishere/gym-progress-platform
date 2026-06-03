@@ -14,6 +14,9 @@ load_dotenv(BASE_DIR / ".env")
 DATABASE_PATH = Path(os.getenv("GYM_DATABASE_PATH", BASE_DIR / "gym_platform.db"))
 DATABASE_URL = os.getenv("GYM_DATABASE_URL", f"sqlite:///{DATABASE_PATH.as_posix()}")
 IS_SQLITE = DATABASE_URL.startswith("sqlite")
+APP_ENV = os.getenv("GYM_APP_ENV", "development").lower()
+if APP_ENV == "production" and IS_SQLITE:
+    raise RuntimeError("GYM_DATABASE_URL must point to PostgreSQL in production")
 
 
 class Base(DeclarativeBase):

@@ -15,6 +15,9 @@ class GymPlatformApiTest(unittest.TestCase):
         os.environ["GYM_DATABASE_URL"] = f"sqlite:///{cls.database.name.replace(os.sep, '/')}"
         os.environ["GYM_APP_ENV"] = "development"
         os.environ["GYM_ALLOWED_HOSTS"] = "*"
+        os.environ["GYM_PUBLIC_SIGNUP_ENABLED"] = "true"
+        os.environ["GYM_PLATFORM_ADMIN_PHONE"] = "+91 90000 99999"
+        os.environ["GYM_PLATFORM_ADMIN_PASSWORD"] = "platform-pass-123"
         os.environ["GYM_SEED_DEMO_DATA"] = "false"
         from main import app
 
@@ -38,7 +41,7 @@ class GymPlatformApiTest(unittest.TestCase):
         from database import engine
         engine.dispose()
         os.unlink(cls.database.name)
-        for key in ("GYM_DATABASE_PATH", "GYM_DATABASE_URL", "GYM_APP_ENV", "GYM_ALLOWED_HOSTS", "GYM_SEED_DEMO_DATA"):
+        for key in ("GYM_DATABASE_PATH", "GYM_DATABASE_URL", "GYM_APP_ENV", "GYM_ALLOWED_HOSTS", "GYM_PUBLIC_SIGNUP_ENABLED", "GYM_PLATFORM_ADMIN_PHONE", "GYM_PLATFORM_ADMIN_PASSWORD", "GYM_SEED_DEMO_DATA"):
             os.environ.pop(key, None)
 
     def test_member_routes_require_authentication_and_use_active_branch(self):
@@ -162,6 +165,39 @@ class GymPlatformApiTest(unittest.TestCase):
         self.assertFalse(me.json()["user"]["must_change_password"])
         self.assertEqual(self.client.post("/api/auth/logout", headers=staff_headers).status_code, 200)
         self.assertEqual(self.client.get("/api/auth/me", headers=staff_headers).status_code, 401)
+
+    def test_platform_admin_can_create_and_suspend_direct_sale_gym(self):
+        login = self.client.post("/api/platform/auth/login", json={"phone": "+91 90000 99999", "password": "platform-pass-123"})
+        self.assertEqual(login.status_code, 200)
+        platform_headers = {"Authorization": f"Bearer {login.json()['token']}"}
+        created = self.client.post(
+            "/api/platform/gyms",
+            headers=platform_headers,
+            json={
+                "gym_name": "Direct Sale Gym",
+                "owner_name": "Direct Owner",
+                "owner_phone": "+91 90000 01010",
+                "temporary_password": "direct-pass-123",
+                "branches": ["Main", "Annex"],
+                "multi_branch_enabled": True,
+            },
+        )
+        self.assertEqual(created.status_code, 201)
+        payload = created.json()
+        self.assertEqual(payload["sales_channel"], "direct")
+        self.assertEqual(payload["account_status"], "active")
+        owner_login = self.client.post(
+            "/api/auth/login",
+            json={"workspace_slug": payload["workspace_slug"], "phone": "+91 90000 01010", "password": "direct-pass-123"},
+        )
+        self.assertEqual(owner_login.status_code, 200)
+        suspended = self.client.patch(f"/api/platform/gyms/{payload['id']}", headers=platform_headers, json={"account_status": "suspended"})
+        self.assertEqual(suspended.status_code, 200)
+        blocked = self.client.post(
+            "/api/auth/login",
+            json={"workspace_slug": payload["workspace_slug"], "phone": "+91 90000 01010", "password": "direct-pass-123"},
+        )
+        self.assertEqual(blocked.status_code, 403)
 
     def test_owner_cannot_assign_a_user_to_another_gyms_branch(self):
         first = self.client.post(

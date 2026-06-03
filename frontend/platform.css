@@ -1,0 +1,138 @@
+.empty-state {
+  padding: 18px 0;
+  color: #8b9591;
+  font-size: 12px;
+}
+
+.platform-shell {
+  min-height: 100vh;
+  padding: 38px 42px;
+  background: #f4f5f1;
+}
+
+.platform-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 20px;
+}
+
+.platform-head small {
+  color: #7b925f;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 1.1px;
+}
+
+.platform-head h1 {
+  margin: 6px 0 4px;
+  font: 700 30px "Space Grotesk";
+}
+
+.platform-head p {
+  margin: 0;
+  color: #7f8c86;
+  font-size: 13px;
+}
+
+.platform-create {
+  margin-bottom: 16px;
+}
+
+.platform-create label {
+  display: block;
+  margin-top: 12px;
+  color: #62716a;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.platform-create input {
+  width: 100%;
+  margin-top: 5px;
+  padding: 10px;
+  border: 1px solid #e0e6df;
+  border-radius: 6px;
+  color: #435049;
+  font-size: 12px;
+  outline: 0;
+}
+
+.platform-create label span {
+  display: block;
+  margin-top: 5px;
+  color: #a0aaa5;
+  font-size: 10px;
+  font-weight: 400;
+}
+
+.checkbox-row {
+  display: flex !important;
+  gap: 8px;
+  align-items: center;
+}
+
+.checkbox-row input {
+  width: auto !important;
+  margin: 0 !important;
+}
+
+.platform-list {
+  display: grid;
+  gap: 10px;
+  margin-top: 15px;
+}
+
+.platform-row {
+  display: grid;
+  grid-template-columns: 1.2fr 1.4fr auto auto auto;
+  gap: 12px;
+  align-items: center;
+  padding: 13px;
+  border: 1px solid #e4e9e1;
+  border-radius: 10px;
+  background: #fff;
+}
+
+.platform-row strong,
+.platform-row small {
+  display: block;
+}
+
+.platform-row strong {
+  color: #283730;
+  font-size: 12px;
+}
+
+.platform-row small {
+  margin-top: 3px;
+  color: #8d9994;
+  font-size: 10px;
+}
+
+.outline-btn.danger {
+  border-color: #efd0c8;
+  color: #a8564b;
+  background: #fff7f5;
+}
+
+@media (max-width: 850px) {
+  .platform-shell {
+    padding: 24px 15px;
+  }
+
+  .platform-head {
+    align-items: flex-start;
+    gap: 12px;
+    flex-direction: column;
+  }
+
+  .platform-row {
+    grid-template-columns: 1fr;
+  }
+
+  .platform-row .outline-btn {
+    justify-content: center;
+    width: 100%;
+  }
+}
