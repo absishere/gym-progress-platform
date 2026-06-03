@@ -1,7 +1,9 @@
 import { FormEvent, ReactElement, useEffect, useState } from "react";
+import "./auth.css";
 import "./styles.css";
 
-const API_URL = "http://127.0.0.1:8000/api";
+const API_URL = import.meta.env.VITE_API_URL ?? "http://127.0.0.1:8000/api";
+const TOKEN_KEY = "forge_owner_token";
 type Portal = "owner" | "member";
 type OwnerView = "overview" | "members" | "retention";
 type MemberView = "home" | "plan" | "progress";
@@ -18,6 +20,9 @@ interface Plan {
   water_liters: number; bmi: number; meals: Meal[]; workouts: Workout[]; note: string;
 }
 interface Progress { id: number; weight_kg: number; recorded_on: string }
+interface Branch { id: number; name: string }
+interface AuthUser { id: number; name: string; role: string; active_branch_id: number; branches: Branch[] }
+interface AuthState { gym: { id: number; name: string; workspace_slug: string; multi_branch_enabled: boolean }; user: AuthUser }
 
 const icons: Record<string, ReactElement> = {
   grid: <><rect x="3" y="3" width="7" height="7" rx="1" /><rect x="14" y="3" width="7" height="7" rx="1" /><rect x="3" y="14" width="7" height="7" rx="1" /><rect x="14" y="14" width="7" height="7" rx="1" /></>,
@@ -66,14 +71,17 @@ const fallbackProgress: Progress[] = [
 ];
 
 async function api<T>(path: string, options?: RequestInit): Promise<T> {
-  const response = await fetch(`${API_URL}${path}`, { headers: { "Content-Type": "application/json" }, ...options });
-  if (!response.ok) throw new Error("API request failed");
+  const token = localStorage.getItem(TOKEN_KEY);
+  const response = await fetch(`${API_URL}${path}`, { ...options, headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}), ...options?.headers } });
+  if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail ?? "API request failed");
   return response.json();
 }
 function initials(name: string) { return name.split(" ").map((word) => word[0]).join("").slice(0, 2); }
 function formatDate(value: string) { return new Intl.DateTimeFormat("en", { day: "numeric", month: "short" }).format(new Date(`${value}T00:00:00`)); }
 
 export default function App() {
+  const [auth, setAuth] = useState<AuthState | null>(null);
+  const [checkingAuth, setCheckingAuth] = useState(Boolean(localStorage.getItem(TOKEN_KEY)));
   const [portal, setPortal] = useState<Portal>("owner");
   const [ownerView, setOwnerView] = useState<OwnerView>("overview");
   const [memberView, setMemberView] = useState<MemberView>("home");
@@ -81,18 +89,40 @@ export default function App() {
   const [plan, setPlan] = useState<Plan>(fallbackPlan);
   const [progress, setProgress] = useState<Progress[]>(fallbackProgress);
   const [toast, setToast] = useState("");
-  useEffect(() => { api<Member[]>("/members").then(setMembers).catch(() => undefined); api<Plan>("/plans/1").then(setPlan).catch(() => undefined); api<Progress[]>("/progress/1").then(setProgress).catch(() => undefined); }, []);
+  useEffect(() => { if (!checkingAuth) return; api<AuthState>("/auth/me").then(setAuth).catch(() => localStorage.removeItem(TOKEN_KEY)).finally(() => setCheckingAuth(false)); }, [checkingAuth]);
+  useEffect(() => { if (!auth) return; api<Member[]>("/members").then(setMembers).catch(() => undefined); }, [auth?.user.active_branch_id]);
   useEffect(() => { if (!toast) return; const timeout = setTimeout(() => setToast(""), 2600); return () => clearTimeout(timeout); }, [toast]);
+  async function logout() { try { await api("/auth/logout", { method: "POST" }); } finally { localStorage.removeItem(TOKEN_KEY); setAuth(null); } }
+  async function selectBranch(branch_id: number) { await api("/auth/select-branch", { method: "POST", body: JSON.stringify({ branch_id }) }); setAuth((current) => current ? { ...current, user: { ...current.user, active_branch_id: branch_id } } : current); }
+  if (checkingAuth) return <div className="auth-loading">Loading Forge...</div>;
+  if (!auth) return <AuthScreen onAuthenticated={(nextAuth, token) => { localStorage.setItem(TOKEN_KEY, token); setAuth(nextAuth); }} />;
   return <div className="app-shell">
     {toast && <div className="toast"><span>✓</span>{toast}</div>}
     {portal === "owner"
-      ? <OwnerPortal members={members} setMembers={setMembers} view={ownerView} setView={setOwnerView} showToast={setToast} switchPortal={() => setPortal("member")} />
+      ? <OwnerPortal auth={auth} members={members} setMembers={setMembers} view={ownerView} setView={setOwnerView} showToast={setToast} switchPortal={() => setPortal("member")} logout={logout} selectBranch={selectBranch} />
       : <MemberPortal view={memberView} setView={setMemberView} plan={plan} setPlan={setPlan} progress={progress} setProgress={setProgress} showToast={setToast} switchPortal={() => setPortal("owner")} />}
   </div>;
 }
 
+function AuthScreen({ onAuthenticated }: { onAuthenticated: (auth: AuthState, token: string) => void }) {
+  const [mode, setMode] = useState<"login" | "signup">("login");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [login, setLogin] = useState({ workspace_slug: "", phone: "", password: "" });
+  const [signup, setSignup] = useState({ gym_name: "", owner_name: "", phone: "", password: "", branches: ["Main Branch"] });
+  async function submit(event: FormEvent) {
+    event.preventDefault(); setError(""); setBusy(true);
+    try {
+      const payload = await api<{ token: string; gym?: AuthState["gym"]; user: AuthUser }>(mode === "login" ? "/auth/login" : "/auth/signup", { method: "POST", body: JSON.stringify(mode === "login" ? login : signup) });
+      const auth = payload.gym ? { gym: payload.gym, user: payload.user } : await api<AuthState>("/auth/me", { headers: { Authorization: `Bearer ${payload.token}` } });
+      onAuthenticated(auth, payload.token);
+    } catch (reason) { setError(reason instanceof Error ? reason.message : "Unable to continue"); } finally { setBusy(false); }
+  }
+  return <div className="auth-page"><form className="auth-card" onSubmit={submit}><Brand /><small>{mode === "login" ? "GYM WORKSPACE LOGIN" : "CREATE YOUR GYM WORKSPACE"}</small><h1>{mode === "login" ? "Welcome back" : "Set up Forge for your gym"}</h1><p>{mode === "login" ? "Use your gym workspace and phone number to continue." : "Start with one branch or add more for a multi-branch setup."}</p>{mode === "login" ? <><label>Workspace slug<input required value={login.workspace_slug} onChange={(e) => setLogin({ ...login, workspace_slug: e.target.value })} placeholder="e.g. forge-fitness" /></label><label>Phone number<input required value={login.phone} onChange={(e) => setLogin({ ...login, phone: e.target.value })} placeholder="+91 98765 43210" /></label><label>Password<input required type="password" value={login.password} onChange={(e) => setLogin({ ...login, password: e.target.value })} /></label></> : <><label>Gym name<input required value={signup.gym_name} onChange={(e) => setSignup({ ...signup, gym_name: e.target.value })} /></label><label>Owner name<input required value={signup.owner_name} onChange={(e) => setSignup({ ...signup, owner_name: e.target.value })} /></label><label>Phone number<input required value={signup.phone} onChange={(e) => setSignup({ ...signup, phone: e.target.value })} /></label><label>Password<input required minLength={8} type="password" value={signup.password} onChange={(e) => setSignup({ ...signup, password: e.target.value })} /></label><label>Branches<input required value={signup.branches.join(", ")} onChange={(e) => setSignup({ ...signup, branches: e.target.value.split(",").map((value) => value.trim()).filter(Boolean) })} placeholder="Main Branch, Indiranagar" /><span>Separate multiple branches with commas.</span></label></>}{error && <div className="auth-error">{error}</div>}<button className="primary-btn auth-submit" disabled={busy}>{busy ? "Please wait..." : mode === "login" ? "Log in" : "Create workspace"}</button><button type="button" className="auth-switch" onClick={() => setMode(mode === "login" ? "signup" : "login")}>{mode === "login" ? "New gym? Create a workspace" : "Already registered? Log in"}</button></form></div>;
+}
+
 function Brand() { return <div className="brand"><div className="brand-mark">F</div><div><strong>FORGE</strong><span>PERFORMANCE CLUB</span></div></div>; }
-function OwnerPortal({ members, setMembers, view, setView, showToast, switchPortal }: { members: Member[]; setMembers: (members: Member[]) => void; view: OwnerView; setView: (view: OwnerView) => void; showToast: (toast: string) => void; switchPortal: () => void }) {
+function OwnerPortal({ auth, members, setMembers, view, setView, showToast, switchPortal, logout, selectBranch }: { auth: AuthState; members: Member[]; setMembers: (members: Member[]) => void; view: OwnerView; setView: (view: OwnerView) => void; showToast: (toast: string) => void; switchPortal: () => void; logout: () => void; selectBranch: (id: number) => void }) {
   const [showAdd, setShowAdd] = useState(false);
   const expiring = members.filter((member) => member.days_left >= 0 && member.days_left <= 7);
   const active = members.filter((member) => member.status !== "expired").length;
@@ -104,6 +134,7 @@ function OwnerPortal({ members, setMembers, view, setView, showToast, switchPort
   return <div className="owner-layout">
     <aside className="sidebar">
       <Brand />
+      {auth.user.branches.length > 1 && <select className="branch-select" value={auth.user.active_branch_id} onChange={(event) => selectBranch(Number(event.target.value))}>{auth.user.branches.map((branch) => <option value={branch.id} key={branch.id}>{branch.name}</option>)}</select>}
       <nav>
         <button className={view === "overview" ? "active" : ""} onClick={() => setView("overview")}><Icon name="grid" />Overview</button>
         <button className={view === "members" ? "active" : ""} onClick={() => setView("members")}><Icon name="users" />Members<span>{members.length}</span></button>
@@ -111,11 +142,12 @@ function OwnerPortal({ members, setMembers, view, setView, showToast, switchPort
       </nav>
       <div className="sidebar-bottom">
         <button onClick={switchPortal}><Icon name="arrow" />Member preview</button>
-        <div className="owner-profile"><div className="avatar">AK</div><div><strong>Arjun Khanna</strong><small>Gym owner</small></div></div>
+        <button onClick={logout}><Icon name="logout" />Log out</button>
+        <div className="owner-profile"><div className="avatar">{initials(auth.user.name)}</div><div><strong>{auth.user.name}</strong><small>{auth.user.role.replace("_", " ")}</small></div></div>
       </div>
     </aside>
     <main className="owner-main">
-      <header className="topbar"><div><small>Sunday, 31 May</small><h1>{view === "overview" ? "Good evening, Arjun" : view === "members" ? "Member directory" : "Retention center"}</h1></div><button className="primary-btn" onClick={() => setShowAdd(true)}><Icon name="plus" size={16} />Add member</button></header>
+      <header className="topbar"><div><small>{auth.gym.name}</small><h1>{view === "overview" ? `Welcome, ${auth.user.name}` : view === "members" ? "Member directory" : "Retention center"}</h1></div><button className="primary-btn" onClick={() => setShowAdd(true)}><Icon name="plus" size={16} />Add member</button></header>
       {view === "overview" && <OwnerOverview members={members} active={active} expiring={expiring} remind={remind} setView={setView} />}
       {view === "members" && <MemberDirectory members={members} remind={remind} />}
       {view === "retention" && <Retention members={expiring} remind={remind} />}
